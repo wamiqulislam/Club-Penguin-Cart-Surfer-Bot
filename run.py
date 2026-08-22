@@ -1,19 +1,12 @@
 """
-Cart Surfer launch-sequence bot
---------------------------------
-Stage 1 of the project: get from the mine room to the Cart Surfer
-title screen and press Play. Score/coin tracking will be layered on
-top of this once the launch sequence is reliable.
+Cart Surfer bot - single entry point
+--------------------------------------
+Runs the whole thing: mine -> Cart Surfer entrance -> confirm dialog
+-> title screen -> Play -> then watches for turn signs and reacts
+with Down + turn key for the rest of the run.
 
-How it works
-------------
-1. Screenshot the screen.
-2. cv2.matchTemplate() the screenshot against a reference image in
-   templates/.
-3. If the match confidence clears CONFIDENCE_THRESHOLD, click on the
-   matched region (or a fixed coordinate, for the mine->game-area
-   click) and move to the next stage.
-4. Repeat until Play has been clicked, or STAGE_TIMEOUT is hit.
+All tunable numbers (coordinates, delays, hold durations, thresholds)
+live in config.py - edit that file, not this one.
 
 Run:
     pip install -r requirements.txt
@@ -23,56 +16,39 @@ Run:
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pyautogui
 
-# ----------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------
+import config
 
-TEMPLATE_DIR = Path(__file__).parent / "templates"
-
-CONFIDENCE_THRESHOLD = 0.8   # 0-1, raise if you get false positives
-POLL_INTERVAL = 0.5          # seconds between screenshot checks
-STAGE_TIMEOUT = 20           # seconds to wait for a stage before giving up
-
-# Fixed point to click while standing in the mine to walk to the
-# Cart Surfer game area (per your instructions).
-MINE_TO_GAME_AREA_CLICK = (1500, 300)
-
-# Failsafe: move mouse to a screen corner to abort (pyautogui built-in)
-pyautogui.FAILSAFE = True
+pyautogui.FAILSAFE = True  # move mouse to a screen corner to abort
 
 
 # ----------------------------------------------------------------------
-# Core matching helpers
+# Core screen / template helpers
 # ----------------------------------------------------------------------
 
 def screenshot_gray() -> np.ndarray:
     """Grab the current screen as a grayscale numpy array."""
     shot = pyautogui.screenshot()
-    frame = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2GRAY)
-    return frame
+    return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2GRAY)
 
 
-def find_template(template_name: str, threshold: float = CONFIDENCE_THRESHOLD):
+def find_template(template_name: str, threshold: float = config.CONFIDENCE_THRESHOLD):
     """
     Look for templates/<template_name> on the current screen.
     Returns (center_x, center_y, confidence) if found above threshold,
     else None.
     """
-    template_path = TEMPLATE_DIR / template_name
+    template_path = config.TEMPLATE_DIR / template_name
     template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
     if template is None:
         raise FileNotFoundError(f"Template not found: {template_path}")
 
     screen = screenshot_gray()
 
-    # Guard against the template being larger than the current screen
-    # capture (e.g. multi-monitor weirdness).
     if template.shape[0] > screen.shape[0] or template.shape[1] > screen.shape[1]:
         return None
 
@@ -88,7 +64,7 @@ def find_template(template_name: str, threshold: float = CONFIDENCE_THRESHOLD):
     return None
 
 
-def wait_for_template(template_name: str, timeout: float = STAGE_TIMEOUT):
+def wait_for_template(template_name: str, timeout: float = config.STAGE_TIMEOUT):
     """Poll until a template appears on screen, or raise TimeoutError."""
     print(f"[wait] looking for '{template_name}' ...")
     start = time.time()
@@ -98,7 +74,7 @@ def wait_for_template(template_name: str, timeout: float = STAGE_TIMEOUT):
             x, y, conf = match
             print(f"[found] '{template_name}' at ({x}, {y}) conf={conf:.2f}")
             return x, y
-        time.sleep(POLL_INTERVAL)
+        time.sleep(config.POLL_INTERVAL)
     raise TimeoutError(f"Timed out waiting for '{template_name}'")
 
 
@@ -108,7 +84,7 @@ def click_at(x: int, y: int, label: str = ""):
     pyautogui.click()
 
 
-def wait_and_click(template_name: str, timeout: float = STAGE_TIMEOUT, label: str = ""):
+def wait_and_click(template_name: str, timeout: float = config.STAGE_TIMEOUT, label: str = ""):
     x, y = wait_for_template(template_name, timeout)
     click_at(x, y, label or template_name)
     return x, y
@@ -132,18 +108,11 @@ def stage_confirm_in_mine():
 def stage_walk_to_game_area():
     """Click the fixed point that walks the character to the Cart
     Surfer entrance."""
-    click_at(*MINE_TO_GAME_AREA_CLICK, label="walk to Cart Surfer entrance")
+    click_at(*config.MINE_TO_GAME_AREA_CLICK, label="walk to Cart Surfer entrance")
 
 
 def stage_confirm_dialog():
-    """'Would you like to go Cart Surfing?' -> click Yes.
-
-    NOTE: yes_button_dialog.png as provided is a crop of the *whole*
-    dialog box, not just the Yes button. That will still generally
-    match the dialog and click near its center, but for reliability
-    you should crop templates/yes_button_dialog.png down to just the
-    Yes button (see the comment in templates/README below).
-    """
+    """'Would you like to go Cart Surfing?' -> click Yes."""
     wait_and_click("yes_button_dialog.png", label="Yes (Cart Surfing dialog)")
 
 
@@ -175,12 +144,106 @@ def run_launch_sequence():
             sys.exit(1)
         time.sleep(0.5)  # brief settle time between stages
 
-    print("\nLaunch sequence complete: Play has been clicked. "
-          "Game should now be loading.")
+    print("\nLaunch sequence complete: Play has been clicked. Game is loading.")
 
+
+# ----------------------------------------------------------------------
+# Gameplay: turn sign reaction
+# ----------------------------------------------------------------------
+# Sign detection here is NOT template matching. At the two fixed watch
+# points, the only time black pixels show up is when a turn sign
+# (black chevron on yellow) is passing through. So we just check: is
+# there a meaningful amount of black in this box right now? If yes,
+# a sign is there.
+
+def region_around(point, radius):
+    x, y = point
+    return (x - radius, y - radius, x + radius, y + radius)
+
+
+def crop(frame: np.ndarray, box):
+    x1, y1, x2, y2 = box
+    h, w = frame.shape
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    return frame[y1:y2, x1:x2]
+
+
+def black_ratio(frame_crop: np.ndarray) -> float:
+    """Fraction of pixels in this crop that are black."""
+    if frame_crop.size == 0:
+        return 0.0
+    black_pixels = np.count_nonzero(frame_crop <= config.BLACK_PIXEL_THRESHOLD)
+    return black_pixels / frame_crop.size
+
+
+def has_sign(frame_crop: np.ndarray) -> tuple:
+    ratio = black_ratio(frame_crop)
+    return ratio >= config.BLACK_PIXEL_RATIO, ratio
+
+
+def react_to_turn(direction: str, ratio: float):
+    """direction: 'left' or 'right'"""
+    turn_key = config.LEFT_KEY if direction == "left" else config.RIGHT_KEY
+    print(f"[sign] {direction} turn detected (black_ratio={ratio:.2f}) -> reacting")
+
+    if config.DELAY_BEFORE_DOWN > 0:
+        time.sleep(config.DELAY_BEFORE_DOWN)
+
+    pyautogui.keyDown(config.DOWN_KEY)
+    print(f"[key] down: {config.DOWN_KEY}")
+
+    time.sleep(config.DELAY_DOWN_TO_TURN)
+
+    pyautogui.keyDown(turn_key)
+    print(f"[key] down: {turn_key} (holding {config.TURN_KEY_HOLD_DURATION}s)")
+    time.sleep(config.TURN_KEY_HOLD_DURATION)
+
+    pyautogui.keyUp(turn_key)
+    pyautogui.keyUp(config.DOWN_KEY)
+    print(f"[key] released {turn_key} and {config.DOWN_KEY}")
+
+
+def watch_for_turns():
+    print("\nWatching for turn signs. Ctrl+C to stop.")
+    left_box = region_around(config.LEFT_TURN_POINT, config.DETECTION_RADIUS)
+    right_box = region_around(config.RIGHT_TURN_POINT, config.DETECTION_RADIUS)
+
+    last_left_reaction = 0.0
+    last_right_reaction = 0.0
+
+    while True:
+        now = time.time()
+        frame = screenshot_gray()
+
+        if now - last_left_reaction > config.REACTION_COOLDOWN:
+            is_sign, ratio = has_sign(crop(frame, left_box))
+            if is_sign:
+                react_to_turn("left", ratio)
+                last_left_reaction = time.time()
+                continue  # re-screenshot fresh next loop
+
+        if now - last_right_reaction > config.REACTION_COOLDOWN:
+            is_sign, ratio = has_sign(crop(frame, right_box))
+            if is_sign:
+                react_to_turn("right", ratio)
+                last_right_reaction = time.time()
+                continue
+
+        time.sleep(config.GAMEPLAY_POLL_INTERVAL)
+
+
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Give yourself a few seconds to switch to the game window.
     print("Starting in 3 seconds - switch to the game window now...")
     time.sleep(3)
+
     run_launch_sequence()
+
+    try:
+        watch_for_turns()
+    except KeyboardInterrupt:
+        print("\nStopped.")
