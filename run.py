@@ -30,10 +30,14 @@ pyautogui.FAILSAFE = True  # move mouse to a screen corner to abort
 # Core screen / template helpers
 # ----------------------------------------------------------------------
 
+def screenshot_rgb() -> np.ndarray:
+    """Grab the current screen as an RGB numpy array."""
+    return np.array(pyautogui.screenshot())
+
+
 def screenshot_gray() -> np.ndarray:
     """Grab the current screen as a grayscale numpy array."""
-    shot = pyautogui.screenshot()
-    return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2GRAY)
+    return cv2.cvtColor(screenshot_rgb(), cv2.COLOR_RGB2GRAY)
 
 
 def find_template(template_name: str, threshold: float = config.CONFIDENCE_THRESHOLD):
@@ -69,6 +73,7 @@ def wait_for_template(template_name: str, timeout: float = config.STAGE_TIMEOUT)
     print(f"[wait] looking for '{template_name}' ...")
     start = time.time()
     while time.time() - start < timeout:
+        check_for_crash_screen()
         match = find_template(template_name)
         if match:
             x, y, conf = match
@@ -88,6 +93,37 @@ def wait_and_click(template_name: str, timeout: float = config.STAGE_TIMEOUT, la
     x, y = wait_for_template(template_name, timeout)
     click_at(x, y, label or template_name)
     return x, y
+
+
+# ----------------------------------------------------------------------
+# Crash recovery ("PRESS SPACEBAR TO CONTINUE")
+# ----------------------------------------------------------------------
+# Can appear at any point. check_for_crash_screen() is cheap to call
+# often - it's wired into both the launch-sequence wait loop and the
+# gameplay loop so it gets caught wherever it happens.
+
+_last_crash_check = 0.0
+
+
+def check_for_crash_screen() -> bool:
+    """If the 'PRESS SPACEBAR TO CONTINUE' screen is up, press space
+    and return True. Rate-limited internally so it's safe to call on
+    every loop tick without slowing things down."""
+    global _last_crash_check
+    now = time.time()
+    if now - _last_crash_check < config.CRASH_CHECK_INTERVAL:
+        return False
+    _last_crash_check = now
+
+    match = find_template("press_spacebar.png")
+    if match:
+        x, y, conf = match
+        print(f"[recover] 'PRESS SPACEBAR TO CONTINUE' detected (conf={conf:.2f}) "
+              f"-> pressing {config.CRASH_RECOVERY_KEY}")
+        pyautogui.press(config.CRASH_RECOVERY_KEY)
+        time.sleep(0.5)  # let it register before anything else happens
+        return True
+    return False
 
 
 # ----------------------------------------------------------------------
@@ -163,7 +199,7 @@ def region_around(point, radius):
 
 def crop(frame: np.ndarray, box):
     x1, y1, x2, y2 = box
-    h, w = frame.shape
+    h, w = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     return frame[y1:y2, x1:x2]
@@ -180,6 +216,21 @@ def black_ratio(frame_crop: np.ndarray) -> float:
 def has_sign(frame_crop: np.ndarray) -> tuple:
     ratio = black_ratio(frame_crop)
     return ratio >= config.BLACK_PIXEL_RATIO, ratio
+
+
+def blue_ratio(frame_crop_rgb: np.ndarray) -> float:
+    """Fraction of pixels in this RGB crop matching the end-screen blue."""
+    if frame_crop_rgb.size == 0:
+        return 0.0
+    target = np.array(config.END_SCREEN_BLUE_RGB)
+    diff = np.abs(frame_crop_rgb.astype(np.int16) - target)
+    matches_mask = np.all(diff <= config.END_SCREEN_COLOR_TOLERANCE, axis=-1)
+    return np.count_nonzero(matches_mask) / matches_mask.size
+
+
+def is_end_screen(frame_crop_rgb: np.ndarray) -> tuple:
+    ratio = blue_ratio(frame_crop_rgb)
+    return ratio >= config.END_SCREEN_BLUE_RATIO, ratio
 
 
 def react_to_turn(direction: str, ratio: float):
@@ -205,32 +256,61 @@ def react_to_turn(direction: str, ratio: float):
 
 
 def watch_for_turns():
-    print("\nWatching for turn signs. Ctrl+C to stop.")
+    """Runs the sign-reaction loop until the end-of-run blue background
+    shows up at END_SCREEN_CHECK_POINT, then returns. Does not click
+    the X - that's handled by the caller, since the X button also
+    appears (and shouldn't be clicked) during normal gameplay."""
+    print("\nWatching for turn signs. Run ends when end-screen blue is detected.")
     left_box = region_around(config.LEFT_TURN_POINT, config.DETECTION_RADIUS)
     right_box = region_around(config.RIGHT_TURN_POINT, config.DETECTION_RADIUS)
+    end_box = region_around(config.END_SCREEN_CHECK_POINT, config.END_SCREEN_DETECTION_RADIUS)
 
     last_left_reaction = 0.0
     last_right_reaction = 0.0
+    last_end_check = 0.0
 
     while True:
         now = time.time()
-        frame = screenshot_gray()
+
+        if check_for_crash_screen():
+            continue  # re-screenshot fresh next loop
+
+        frame_rgb = screenshot_rgb()
+        frame_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
 
         if now - last_left_reaction > config.REACTION_COOLDOWN:
-            is_sign, ratio = has_sign(crop(frame, left_box))
+            is_sign, ratio = has_sign(crop(frame_gray, left_box))
             if is_sign:
                 react_to_turn("left", ratio)
                 last_left_reaction = time.time()
                 continue  # re-screenshot fresh next loop
 
         if now - last_right_reaction > config.REACTION_COOLDOWN:
-            is_sign, ratio = has_sign(crop(frame, right_box))
+            is_sign, ratio = has_sign(crop(frame_gray, right_box))
             if is_sign:
                 react_to_turn("right", ratio)
                 last_right_reaction = time.time()
                 continue
 
+        if now - last_end_check > config.END_SCREEN_POLL_INTERVAL:
+            last_end_check = now
+            ended, ratio = is_end_screen(crop(frame_rgb, end_box))
+            if ended:
+                print(f"[found] end-of-run blue detected (ratio={ratio:.2f})")
+                return
+
         time.sleep(config.GAMEPLAY_POLL_INTERVAL)
+
+
+# ----------------------------------------------------------------------
+# End of run: close summary screen and loop
+# ----------------------------------------------------------------------
+
+def finish_run():
+    """Handle the end-of-run screen: wait for it, then click the X."""
+    watch_for_turns()
+    wait_and_click("end_screen_close.png", label="close summary screen (X)")
+    time.sleep(config.POST_CLOSE_SETTLE)
 
 
 # ----------------------------------------------------------------------
@@ -241,9 +321,12 @@ if __name__ == "__main__":
     print("Starting in 3 seconds - switch to the game window now...")
     time.sleep(3)
 
-    run_launch_sequence()
-
+    run_number = 0
     try:
-        watch_for_turns()
+        while True:
+            run_number += 1
+            print(f"\n########## RUN {run_number} ##########")
+            run_launch_sequence()
+            finish_run()
     except KeyboardInterrupt:
         print("\nStopped.")
