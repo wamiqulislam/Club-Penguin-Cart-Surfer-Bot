@@ -42,7 +42,7 @@ BLACK_PIXEL_THRESHOLD = 10
 # for it to count as a sign being present. Tune this up if background
 # scenery is triggering false positives, down if the sign isn't
 # reliably detected.
-BLACK_PIXEL_RATIO = 0.05
+BLACK_PIXEL_RATIO = 0.02
 
 # Key bindings - change if Cart Surfer uses different keys.
 DOWN_KEY = "down"
@@ -50,8 +50,8 @@ LEFT_KEY = "left"
 RIGHT_KEY = "right"
 
 # --- Timing you'll tune ---
-DELAY_BEFORE_DOWN = 0.5        # delay from sign detection to Down keypress
-DELAY_DOWN_TO_TURN = 0.2       # delay from Down keypress to turn key press
+DELAY_BEFORE_DOWN = 0.6        # delay from sign detection to Down keypress
+DELAY_DOWN_TO_TURN = 0.1       # delay from Down keypress to turn key press
 TURN_KEY_HOLD_DURATION = 1   # how long to hold the turn key down
 
 # After reacting to a sign, ignore that same point for this long so we
@@ -98,6 +98,37 @@ END_SCREEN_POLL_INTERVAL = GAMEPLAY_POLL_INTERVAL
 # Delay after clicking the close (X) button before starting the next
 # launch sequence, to let the mine screen finish loading.
 POST_CLOSE_SETTLE = 1.0
+
+# ----------------------------------------------------------------------
+# Tricks (back flip / side flip) - run continuously between turns
+# ----------------------------------------------------------------------
+# Alternates back flip, side flip, back flip, side flip... in a
+# background thread, at the same time signs are being watched for.
+# When a turn sign is detected, no *new* tricks are started, but a
+# trick already in progress is NOT waited on or cancelled - the turn
+# reaction's own delay (DELAY_BEFORE_DOWN + DELAY_DOWN_TO_TURN above)
+# starts counting down immediately from the moment the sign is seen,
+# and is assumed to be long enough to cover any stray trick finishing.
+
+TRICK_KEY = "space"          # key that starts any trick
+TRICK_KEY_GAP = 0.1          # delay between the trick key and the direction key
+
+BACKFLIP_KEY = "down"
+SIDEFLIP_KEY = "left"
+
+# Which trick(s) the background thread performs:
+#   "alternate"      - back flip, side flip, back flip, side flip, ...
+#   "backflip_only"  - back flip every time
+#   "sideflip_only"  - side flip every time
+TRICK_MODE = "alternate"
+
+# Cooldown after each specific trick
+BACKFLIP_COOLDOWN = 1
+SIDEFLIP_COOLDOWN = 0.7
+
+# How often the trick thread checks whether it's allowed to start a
+# new trick (i.e. no turn currently in progress).
+TRICK_PAUSE_POLL = 0.01
 
 # ----------------------------------------------------------------------
 # Crash recovery ("PRESS SPACEBAR TO CONTINUE")

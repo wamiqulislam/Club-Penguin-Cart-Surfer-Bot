@@ -14,6 +14,7 @@ Run:
 """
 
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -233,10 +234,81 @@ def is_end_screen(frame_crop_rgb: np.ndarray) -> tuple:
     return ratio >= config.END_SCREEN_BLUE_RATIO, ratio
 
 
+# ----------------------------------------------------------------------
+# Tricks (back flip / side flip) - run in a background thread,
+# continuously, at the same time signs are being watched for.
+# ----------------------------------------------------------------------
+
+_tricks_allowed = threading.Event()  # set = ok to start a new trick
+_trick_thread_stop = threading.Event()
+
+
+def do_backflip():
+    """Back flip: Down first, then Space."""
+    print("[trick] back flip")
+    pyautogui.press(config.BACKFLIP_KEY)
+    time.sleep(config.TRICK_KEY_GAP)
+    pyautogui.press(config.TRICK_KEY)
+
+
+def do_sideflip():
+    """Side flip: Space first, then Left."""
+    print("[trick] side flip")
+    pyautogui.press(config.TRICK_KEY)
+    time.sleep(config.TRICK_KEY_GAP)
+    pyautogui.press(config.SIDEFLIP_KEY)
+
+
+def _trick_loop():
+    """Background thread body. Performs tricks according to
+    config.TRICK_MODE whenever tricks are allowed. When a turn sign is
+    detected, react_to_turn() clears _tricks_allowed immediately - this
+    loop will simply not START a new trick after that point, but a
+    trick already in flight here just finishes on its own; nothing
+    waits on it and nothing cancels it mid-way."""
+    do_backflip_next = True
+    while not _trick_thread_stop.is_set():
+        if _tricks_allowed.is_set():
+            if config.TRICK_MODE == "backflip_only":
+                do_backflip()
+                time.sleep(config.BACKFLIP_COOLDOWN)
+            elif config.TRICK_MODE == "sideflip_only":
+                do_sideflip()
+                time.sleep(config.SIDEFLIP_COOLDOWN)
+            else:  # "alternate"
+                if do_backflip_next:
+                    do_backflip()
+                    time.sleep(config.BACKFLIP_COOLDOWN)
+                else:
+                    do_sideflip()
+                    time.sleep(config.SIDEFLIP_COOLDOWN)
+                do_backflip_next = not do_backflip_next
+        else:
+            time.sleep(config.TRICK_PAUSE_POLL)
+
+
+def start_trick_thread():
+    _trick_thread_stop.clear()
+    _tricks_allowed.set()
+    thread = threading.Thread(target=_trick_loop, daemon=True)
+    thread.start()
+    return thread
+
+
+def stop_trick_thread(thread: threading.Thread):
+    _tricks_allowed.clear()
+    _trick_thread_stop.set()
+    thread.join(timeout=2)
+
+
 def react_to_turn(direction: str, ratio: float):
     """direction: 'left' or 'right'"""
     turn_key = config.LEFT_KEY if direction == "left" else config.RIGHT_KEY
     print(f"[sign] {direction} turn detected (black_ratio={ratio:.2f}) -> reacting")
+
+    # Stop new tricks from starting, but do NOT wait for a trick that's
+    # already in progress - the delay below runs concurrently with it.
+    _tricks_allowed.clear()
 
     if config.DELAY_BEFORE_DOWN > 0:
         time.sleep(config.DELAY_BEFORE_DOWN)
@@ -254,12 +326,19 @@ def react_to_turn(direction: str, ratio: float):
     pyautogui.keyUp(config.DOWN_KEY)
     print(f"[key] released {turn_key} and {config.DOWN_KEY}")
 
+    # Turn is done - tricks can resume.
+    _tricks_allowed.set()
+
 
 def watch_for_turns():
     """Runs the sign-reaction loop until the end-of-run blue background
     shows up at END_SCREEN_CHECK_POINT, then returns. Does not click
     the X - that's handled by the caller, since the X button also
-    appears (and shouldn't be clicked) during normal gameplay."""
+    appears (and shouldn't be clicked) during normal gameplay.
+
+    Tricks (back flip / side flip) run continuously in a background
+    thread for the duration of this function - see start_trick_thread /
+    react_to_turn for how they pause around turns."""
     print("\nWatching for turn signs. Run ends when end-screen blue is detected.")
     left_box = region_around(config.LEFT_TURN_POINT, config.DETECTION_RADIUS)
     right_box = region_around(config.RIGHT_TURN_POINT, config.DETECTION_RADIUS)
@@ -269,37 +348,41 @@ def watch_for_turns():
     last_right_reaction = 0.0
     last_end_check = 0.0
 
-    while True:
-        now = time.time()
+    trick_thread = start_trick_thread()
+    try:
+        while True:
+            now = time.time()
 
-        if check_for_crash_screen():
-            continue  # re-screenshot fresh next loop
-
-        frame_rgb = screenshot_rgb()
-        frame_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-
-        if now - last_left_reaction > config.REACTION_COOLDOWN:
-            is_sign, ratio = has_sign(crop(frame_gray, left_box))
-            if is_sign:
-                react_to_turn("left", ratio)
-                last_left_reaction = time.time()
+            if check_for_crash_screen():
                 continue  # re-screenshot fresh next loop
 
-        if now - last_right_reaction > config.REACTION_COOLDOWN:
-            is_sign, ratio = has_sign(crop(frame_gray, right_box))
-            if is_sign:
-                react_to_turn("right", ratio)
-                last_right_reaction = time.time()
-                continue
+            frame_rgb = screenshot_rgb()
+            frame_gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
 
-        if now - last_end_check > config.END_SCREEN_POLL_INTERVAL:
-            last_end_check = now
-            ended, ratio = is_end_screen(crop(frame_rgb, end_box))
-            if ended:
-                print(f"[found] end-of-run blue detected (ratio={ratio:.2f})")
-                return
+            if now - last_left_reaction > config.REACTION_COOLDOWN:
+                is_sign, ratio = has_sign(crop(frame_gray, left_box))
+                if is_sign:
+                    react_to_turn("left", ratio)
+                    last_left_reaction = time.time()
+                    continue  # re-screenshot fresh next loop
 
-        time.sleep(config.GAMEPLAY_POLL_INTERVAL)
+            if now - last_right_reaction > config.REACTION_COOLDOWN:
+                is_sign, ratio = has_sign(crop(frame_gray, right_box))
+                if is_sign:
+                    react_to_turn("right", ratio)
+                    last_right_reaction = time.time()
+                    continue
+
+            if now - last_end_check > config.END_SCREEN_POLL_INTERVAL:
+                last_end_check = now
+                ended, ratio = is_end_screen(crop(frame_rgb, end_box))
+                if ended:
+                    print(f"[found] end-of-run blue detected (ratio={ratio:.2f})")
+                    return
+
+            time.sleep(config.GAMEPLAY_POLL_INTERVAL)
+    finally:
+        stop_trick_thread(trick_thread)
 
 
 # ----------------------------------------------------------------------
